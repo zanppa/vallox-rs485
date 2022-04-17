@@ -50,10 +50,24 @@ const (
 	FanSpeed byte = 0x29
 
 	// Registers Vallox is broadcasting temperatures
-	TempIncomingOutside byte = 0x58
-	TempOutgoingInside  byte = 0x5a
-	TempIncomingInside  byte = 0x5b
-	TempOutgoingOutside byte = 0x5c
+	TempIncomingOutside byte = 0x32
+	TempOutgoingInside  byte = 0x34
+	TempIncomingInside  byte = 0x35
+	TempOutgoingOutside byte = 0x33
+	TempTargetInside    byte = 0x57
+	TempPostHeating     byte = 0xA4
+
+	// Times
+	TimeBoosting byte = 0x79  // Fireplace or boosting time left in minutes
+
+	// Flags and misc registers
+	IOPort byte = 0x08
+	Flags2 byte = 0x6D
+	Flags6 byte = 0x71
+	Lights byte = 0xA3
+
+	// Error codes
+	ErrorCode byte = 0x36
 )
 
 type Event struct {
@@ -276,9 +290,14 @@ func event(pkg *valloxPackage, vallox *Vallox) *Event {
 		event.Value = int16(valueToTemp(pkg.Value))
 	case TempOutgoingOutside:
 		event.Value = int16(valueToTemp(pkg.Value))
+	case TempTargetInside:
+		event.Value = int16(valueToTemp(pkg.Value))
+	case TempPostHeating:
+		event.Value = int16(valueToTemp(pkg.Value))
 	default:
 		event.Value = int16(pkg.Value)
 	}
+	//vallox.logDebug.Printf("event %x, %x, %x", pkg.Register, pkg.Value, event.Value)
 	return event
 }
 
