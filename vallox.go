@@ -2,13 +2,13 @@
 package valloxrs485
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"math"
+	"sync"
 	"time"
 
 	"github.com/tarm/serial"
@@ -30,12 +30,42 @@ type Vallox struct {
 	port           *serial.Port
 	remoteClientId byte
 	running        bool
-	buffer         *bufio.ReadWriter
-	in             chan Event
-	out            chan valloxPackage
-	lastActivity   time.Time
-	writeAllowed   bool
-	logDebug       *log.Logger
+	//buffer         *bufio.ReadWriter
+	buf          *bytes.Buffer
+	in           chan Event
+	out          chan valloxPackage
+	lastActivity time.Time
+	writeAllowed bool
+	logDebug     *log.Logger
+	mutex        sync.Mutex
+
+	co2 twoByteValue
+}
+
+type twoByteValue struct {
+	high byteValue
+	low  byteValue
+}
+
+func (tbv *twoByteValue) validValue(now time.Time) (int16, bool) {
+	limit := now.Add(-500 * time.Millisecond)
+	if tbv.high.at.Before(limit) {
+		return -1, false
+	}
+	if tbv.low.at.Before(limit) {
+		return -1, false
+	}
+	// Both values are within 500ms of the current time
+	res := int16(tbv.high.value)<<8 + int16(tbv.low.value)
+	if res <= 0 {
+		return -1, false
+	}
+	return res, true
+}
+
+type byteValue struct {
+	at    time.Time
+	value byte
 }
 
 const (
@@ -50,15 +80,28 @@ const (
 	FanSpeed byte = 0x29
 
 	// Registers Vallox is broadcasting temperatures
-	TempIncomingOutside byte = 0x32
-	TempOutgoingInside  byte = 0x34
-	TempIncomingInside  byte = 0x35
-	TempOutgoingOutside byte = 0x33
+	TempIncomingOutside byte = 0x58
+	TempOutgoingInside  byte = 0x5a
+	TempIncomingInside  byte = 0x5b
+	TempOutgoingOutside byte = 0x5c
+
+	// Registers for newer protocol
+	TempIncomingOutsideNew byte = 0x32
+	TempOutgoingInsideNew  byte = 0x34
+	TempIncomingInsideNew  byte = 0x35
+	TempOutgoingOutsideNew byte = 0x33
+
+	RhHighest          byte = 0x2a
+	Co2HighestHighByte byte = 0x2b
+	Co2HighestLowByte  byte = 0x2c
+	Rh1                byte = 0x2f
+	Rh2                byte = 0x30
+
 	TempTargetInside    byte = 0x57
 	TempPostHeating     byte = 0xA4		// Post-heating target temperature
 	TempHexBypass       byte = 0xAF		// Temperature where heat exchanger is bypassed
 
-	PostHeating         byte = 0x07		// Post heating, 1=enable, 0=disable
+	PostHeatingEnabled  byte = 0x07		// bit 5 = Post heating, i.e. 0x20=enable, 0=disable
 
 	// Times
 	TimeBoosting byte = 0x79  // Fireplace or boosting time left in minutes
@@ -97,7 +140,7 @@ var writeAllowed = map[byte]bool{FanSpeed: true}
 func Open(cfg Config) (*Vallox, error) {
 
 	if cfg.LogDebug == nil {
-		cfg.LogDebug = log.New(ioutil.Discard, "", 0)
+		cfg.LogDebug = log.New(io.Discard, "", 0)
 	}
 
 	if cfg.RemoteClientId == 0 {
@@ -118,10 +161,10 @@ func Open(cfg Config) (*Vallox, error) {
 	vallox := &Vallox{
 		port:           port,
 		running:        true,
-		buffer:         bufio.NewReadWriter(bufio.NewReader(buffer), bufio.NewWriter(buffer)),
+		buf:            buffer,
 		remoteClientId: cfg.RemoteClientId,
-		in:             make(chan Event, 15),
-		out:            make(chan valloxPackage, 15),
+		in:             make(chan Event, 50),
+		out:            make(chan valloxPackage, 50),
 		writeAllowed:   cfg.EnableWrite,
 		logDebug:       cfg.LogDebug,
 	}
@@ -135,23 +178,23 @@ func Open(cfg Config) (*Vallox, error) {
 }
 
 // Events returns channel for events from Vallox bus
-func (vallox Vallox) Events() chan Event {
+func (vallox *Vallox) Events() chan Event {
 	return vallox.in
 }
 
 // ForMe returns true if event is addressed for this client
-func (vallox Vallox) ForMe(e Event) bool {
+func (vallox *Vallox) ForMe(e Event) bool {
 	return e.Destination == RemoteClientMulticast || e.Destination == vallox.remoteClientId
 }
 
 // Query queries Vallox for register
-func (vallox Vallox) Query(register byte) {
+func (vallox *Vallox) Query(register byte) {
 	pkg := createQuery(vallox, register)
 	vallox.out <- *pkg
 }
 
 // SetSpeed changes speed of ventilation fan
-func (vallox Vallox) SetSpeed(speed byte) {
+func (vallox *Vallox) SetSpeed(speed byte) {
 	if speed < 1 || speed > 8 {
 		vallox.logDebug.Printf("received invalid speed %x", speed)
 		return
@@ -168,16 +211,16 @@ func sendInit(vallox *Vallox) {
 	vallox.Query(FanSpeed)
 }
 
-func (vallox Vallox) writeRegister(destination byte, register byte, value byte) {
+func (vallox *Vallox) writeRegister(destination byte, register byte, value byte) {
 	pkg := createWrite(vallox, destination, register, value)
 	vallox.out <- *pkg
 }
 
-func createQuery(vallox Vallox, register byte) *valloxPackage {
+func createQuery(vallox *Vallox, register byte) *valloxPackage {
 	return createWrite(vallox, DeviceMain, 0, register)
 }
 
-func createWrite(vallox Vallox, destination byte, register byte, value byte) *valloxPackage {
+func createWrite(vallox *Vallox, destination byte, register byte, value byte) *valloxPackage {
 	pkg := new(valloxPackage)
 	pkg.System = 1
 	pkg.Source = vallox.remoteClientId
@@ -186,6 +229,22 @@ func createWrite(vallox Vallox, destination byte, register byte, value byte) *va
 	pkg.Value = value
 	pkg.Checksum = calculateChecksum(pkg)
 	return pkg
+}
+
+func (vallox *Vallox) ifBusFreeProceed() bool {
+	vallox.mutex.Lock()
+	defer vallox.mutex.Unlock()
+	if time.Since(vallox.lastActivity) < 100*time.Millisecond {
+		return false
+	}
+	vallox.lastActivity = time.Now()
+	return true
+}
+
+func (vallox *Vallox) getLastActivity() time.Time {
+	vallox.mutex.Lock()
+	defer vallox.mutex.Unlock()
+	return vallox.lastActivity
 }
 
 func handleOutgoing(vallox *Vallox) {
@@ -197,16 +256,16 @@ func handleOutgoing(vallox *Vallox) {
 			continue
 		}
 
-		now := time.Now()
-		if vallox.lastActivity.IsZero() || now.UnixMilli()-vallox.lastActivity.UnixMilli() < 50 {
-			vallox.logDebug.Printf("delay outgoing from %x to %x %x = %x, lastActivity %v now %v, diff %d ms",
-				pkg.Source, pkg.Destination, pkg.Register, pkg.Value, vallox.lastActivity, now, now.UnixMilli()-vallox.lastActivity.UnixMilli())
-			time.Sleep(time.Millisecond * 50)
-			vallox.out <- pkg
-		} else {
-			updateLastActivity(vallox)
+		if vallox.ifBusFreeProceed() {
 			binary.Write(vallox.port, binary.BigEndian, pkg)
-			vallox.logDebug.Printf("sent outgoing from %x to %x %x = %x", pkg.Source, pkg.Destination, pkg.Register, pkg.Value)
+			vallox.logDebug.Printf("sent outgoing to %x %x = %x", pkg.Destination, pkg.Register, pkg.Value)
+		} else {
+			la := vallox.getLastActivity()
+			now := time.Now()
+			vallox.logDebug.Printf("delay outgoing to %x %x = %x, lastActivity %v now %v, diff %d ms",
+				pkg.Destination, pkg.Register, pkg.Value, la, now, time.Since(la).Milliseconds())
+			time.Sleep(time.Millisecond * 57)
+			vallox.out <- pkg
 		}
 	}
 }
@@ -226,7 +285,7 @@ func isOutgoingAllowed(vallox *Vallox, register byte) bool {
 
 func handleIncoming(vallox *Vallox) {
 	vallox.running = true
-	buf := make([]byte, 6)
+	buf := make([]byte, 128)
 	for vallox.running {
 		n, err := vallox.port.Read(buf)
 		if err != nil {
@@ -234,45 +293,87 @@ func handleIncoming(vallox *Vallox) {
 			return
 		}
 		if n > 0 {
-			updateLastActivity(vallox)
-			vallox.buffer.Write(buf[:n])
-			vallox.buffer.Writer.Flush()
+			vallox.updateLastActivity()
+			vallox.buf.Write(buf[:n])
 			handleBuffer(vallox)
 		}
 	}
 }
 
-func updateLastActivity(vallox *Vallox) {
+func (vallox *Vallox) updateLastActivity() {
+	vallox.mutex.Lock()
+	defer vallox.mutex.Unlock()
 	vallox.lastActivity = time.Now()
 }
 
 func fatalError(err error, vallox *Vallox) {
+	vallox.logDebug.Printf("fatal error %v", err)
 	vallox.running = false
 }
 
 func handleBuffer(vallox *Vallox) {
-	for {
-		buf, err := vallox.buffer.Peek(6)
-		if err != nil && err == io.EOF {
-			// not enough bytes, ok, continue
-			return
-		} else if err != nil {
-			fatalError(err, vallox)
-			return
-		}
+	for vallox.buf.Len() >= 6 {
+		buf := vallox.buf.Bytes()
 		pkg := validPackage(buf)
 		if pkg != nil {
-			vallox.buffer.Discard(6)
+			vallox.buf.Next(6)
 			handlePackage(pkg, vallox)
 		} else {
 			// discard byte, since no valid package starts here
-			vallox.buffer.ReadByte()
+			vallox.buf.ReadByte()
 		}
 	}
 }
 
 func handlePackage(pkg *valloxPackage, vallox *Vallox) {
-	vallox.in <- *event(pkg, vallox)
+	e := event(pkg, vallox)
+	if e != nil {
+		vallox.in <- *e
+	} else {
+		vallox.logDebug.Printf("discarding package from %x register %x value %x", pkg.Source, pkg.Register, pkg.Value)
+	}
+}
+
+type mapFn func(byte, *Vallox) (int16, bool)
+
+var registerMap = map[byte]mapFn{
+	FanSpeed:               valueToSpeed,
+	TempIncomingInside:     valueToTemp,
+	TempIncomingOutside:    valueToTemp,
+	TempOutgoingInside:     valueToTemp,
+	TempOutgoingOutside:    valueToTemp,
+	TempIncomingInsideNew:  valueToTemp,
+	TempIncomingOutsideNew: valueToTemp,
+	TempOutgoingInsideNew:  valueToTemp,
+	TempOutgoingOutsideNew: valueToTemp,
+	TempTargetInside:       valueToTemp,
+	TempPostHeating:        valueToTemp,
+	TempHexBypass:          valueToTemp,
+
+	RhHighest:          valueToRh,
+	Rh1:                valueToRh,
+	Rh2:                valueToRh,
+	Co2HighestHighByte: valueToCo2High,
+	Co2HighestLowByte:  valueToCo2Low,
+}
+
+func valueToRh(val byte, vallox *Vallox) (int16, bool) {
+	if val < 0x33 {
+		return -1, false
+	}
+	return int16(math.Round(float64((float32(val) - 51.0) / 2.04))), true
+}
+
+func valueToCo2High(val byte, vallox *Vallox) (int16, bool) {
+	now := time.Now()
+	vallox.co2.high = byteValue{at: now, value: val}
+	return vallox.co2.validValue(now)
+}
+
+func valueToCo2Low(val byte, vallox *Vallox) (int16, bool) {
+	now := time.Now()
+	vallox.co2.low = byteValue{at: now, value: val}
+	return vallox.co2.validValue(now)
 }
 
 func event(pkg *valloxPackage, vallox *Vallox) *Event {
@@ -282,52 +383,42 @@ func event(pkg *valloxPackage, vallox *Vallox) *Event {
 	event.Destination = pkg.Destination
 	event.Register = pkg.Register
 	event.RawValue = pkg.Value
-	switch pkg.Register {
-	case FanSpeed:
-		event.Value = int16(valueToSpeed(pkg.Value))
-	case TempIncomingInside:
-		event.Value = int16(valueToTemp(pkg.Value))
-	case TempIncomingOutside:
-		event.Value = int16(valueToTemp(pkg.Value))
-	case TempOutgoingInside:
-		event.Value = int16(valueToTemp(pkg.Value))
-	case TempOutgoingOutside:
-		event.Value = int16(valueToTemp(pkg.Value))
-	case TempTargetInside:
-		event.Value = int16(valueToTemp(pkg.Value))
-	case TempPostHeating:
-		event.Value = int16(valueToTemp(pkg.Value))
-	case TempHexBypass:
-		event.Value = int16(valueToTemp(pkg.Value))
-	default:
+
+	mapFn, found := registerMap[pkg.Register]
+	if found {
+		val, ok := mapFn(pkg.Value, vallox)
+		if !ok {
+			return nil
+		}
+		event.Value = int16(val)
+	} else {
 		event.Value = int16(pkg.Value)
 	}
 	//vallox.logDebug.Printf("event %x, %x, %x", pkg.Register, pkg.Value, event.Value)
 	return event
 }
 
-func valueToSpeed(value byte) int8 {
+func valueToSpeed(value byte, vallox *Vallox) (int16, bool) {
 	for i, v := range fanSpeedConversion {
 		if value == v {
-			return int8(i) + 1
+			return int16(i) + 1, true
 		}
 	}
-	return -1
+	return -1, false
 }
 
 func speedToValue(speed int8) byte {
 	return fanSpeedConversion[speed-1]
 }
 
-func valueToTemp(value byte) int8 {
-	return tempConversion[value]
+func valueToTemp(value byte, vallox *Vallox) (int16, bool) {
+	return tempConversion[value], true
 }
 
-func validPackage(buffer []byte) (pkg *valloxPackage) {
-	pkg = new(valloxPackage)
-	err := binary.Read(bytes.NewReader(buffer), binary.LittleEndian, pkg)
+func validPackage(buf []byte) (pkg *valloxPackage) {
+	pkg = &valloxPackage{buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]}
 
-	if err == nil && validChecksum(pkg) {
+	if validChecksum(pkg) && pkg.System == 1 {
 		return pkg
 	}
 
@@ -344,7 +435,7 @@ func calculateChecksum(pkg *valloxPackage) byte {
 
 var fanSpeedConversion = [8]byte{0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff}
 
-var tempConversion = [256]int8{
+var tempConversion = [256]int16{
 	-74, -70, -66, -62, -59, -56, -54, -52, -50, -48, -47, -46, -44, -43, -42, -41,
 	-40, -39, -38, -37, -36, -35, -34, -33, -33, -32, -31, -30, -30, -29, -28, -28, -27, -27, -26, -25, -25,
 	-24, -24, -23, -23, -22, -22, -21, -21, -20, -20, -19, -19, -19, -18, -18, -17, -17, -16, -16, -16, -15,
