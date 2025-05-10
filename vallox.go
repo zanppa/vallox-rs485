@@ -55,7 +55,10 @@ const (
 	TempIncomingInside  byte = 0x35
 	TempOutgoingOutside byte = 0x33
 	TempTargetInside    byte = 0x57
-	TempPostHeating     byte = 0xA4
+	TempPostHeating     byte = 0xA4		// Post-heating target temperature
+	TempHexBypass       byte = 0xAF		// Temperature where heat exchanger is bypassed
+
+	PostHeating         byte = 0x07		// Post heating, 1=enable, 0=disable
 
 	// Times
 	TimeBoosting byte = 0x79  // Fireplace or boosting time left in minutes
@@ -101,7 +104,7 @@ func Open(cfg Config) (*Vallox, error) {
 		cfg.RemoteClientId = 0x27
 	}
 
-	if cfg.RemoteClientId < 0x20 || cfg.RemoteClientId > 0x2f {
+	if cfg.RemoteClientId < 0x21 || cfg.RemoteClientId > 0x2f {
 		return nil, fmt.Errorf("invalid remoteClientId %x", cfg.RemoteClientId)
 	}
 
@@ -196,14 +199,14 @@ func handleOutgoing(vallox *Vallox) {
 
 		now := time.Now()
 		if vallox.lastActivity.IsZero() || now.UnixMilli()-vallox.lastActivity.UnixMilli() < 50 {
-			vallox.logDebug.Printf("delay outgoing to %x %x = %x, lastActivity %v now %v, diff %d ms",
-				pkg.Destination, pkg.Register, pkg.Value, vallox.lastActivity, now, now.UnixMilli()-vallox.lastActivity.UnixMilli())
+			vallox.logDebug.Printf("delay outgoing from %x to %x %x = %x, lastActivity %v now %v, diff %d ms",
+				pkg.Source, pkg.Destination, pkg.Register, pkg.Value, vallox.lastActivity, now, now.UnixMilli()-vallox.lastActivity.UnixMilli())
 			time.Sleep(time.Millisecond * 50)
 			vallox.out <- pkg
 		} else {
 			updateLastActivity(vallox)
 			binary.Write(vallox.port, binary.BigEndian, pkg)
-			vallox.logDebug.Printf("sent outgoing to %x %x = %x", pkg.Destination, pkg.Register, pkg.Value)
+			vallox.logDebug.Printf("sent outgoing from %x to %x %x = %x", pkg.Source, pkg.Destination, pkg.Register, pkg.Value)
 		}
 	}
 }
@@ -293,6 +296,8 @@ func event(pkg *valloxPackage, vallox *Vallox) *Event {
 	case TempTargetInside:
 		event.Value = int16(valueToTemp(pkg.Value))
 	case TempPostHeating:
+		event.Value = int16(valueToTemp(pkg.Value))
+	case TempHexBypass:
 		event.Value = int16(valueToTemp(pkg.Value))
 	default:
 		event.Value = int16(pkg.Value)
