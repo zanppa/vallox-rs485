@@ -134,7 +134,15 @@ type valloxPackage struct {
 	Checksum    byte
 }
 
-var writeAllowed = map[byte]bool{FanSpeed: true}
+type mapWriteFn func(int16, *Vallox) (byte, bool)
+
+//var writeAllowed = map[byte]bool{FanSpeed: true}
+var writeAllowed = map[byte]mapWriteFn {
+	FanSpeed:		speedToValue,
+
+	TempPostHeating:	tempToValue,
+	TempHexBypass:		tempToValue,
+}
 
 // Open opens the rs485 device specified in Config
 func Open(cfg Config) (*Vallox, error) {
@@ -195,11 +203,10 @@ func (vallox *Vallox) Query(register byte) {
 
 // SetSpeed changes speed of ventilation fan
 func (vallox *Vallox) SetSpeed(speed byte) {
-	if speed < 1 || speed > 8 {
-		vallox.logDebug.Printf("received invalid speed %x", speed)
+	value, ok := speedToValue(int16(speed), vallox)
+	if !ok {
 		return
 	}
-	value := speedToValue(int8(speed))
 	vallox.logDebug.Printf("received set speed %x", speed)
 	// Send value to the main vallox device
 	vallox.writeRegister(DeviceMain, FanSpeed, value)
@@ -280,7 +287,8 @@ func isOutgoingAllowed(vallox *Vallox, register byte) bool {
 		return false
 	}
 
-	return writeAllowed[register]
+	_, found := writeAllowed[register]
+	return found
 }
 
 func handleIncoming(vallox *Vallox) {
@@ -407,12 +415,35 @@ func valueToSpeed(value byte, vallox *Vallox) (int16, bool) {
 	return -1, false
 }
 
-func speedToValue(speed int8) byte {
-	return fanSpeedConversion[speed-1]
+func speedToValue(speed int16, vallox *Vallox) (byte, bool) {
+	if speed < 1 || speed > 8 {
+		vallox.logDebug.Printf("received invalid speed %x", speed)
+		return 0x01, false
+	}
+	return fanSpeedConversion[speed-1], true
 }
 
 func valueToTemp(value byte, vallox *Vallox) (int16, bool) {
 	return tempConversion[value], true
+}
+
+func tempToValue(temp int16, vallox *Vallox) (byte, bool) {
+	var min_delta int16 = 1000
+	var index byte = 0
+
+	for i, v := range tempConversion {
+		delta := v - temp
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta < min_delta {
+			index = byte(i)
+			min_delta = delta
+		} else if delta > min_delta {
+			return index, true
+		}
+	}
+	return index, true
 }
 
 func validPackage(buf []byte) (pkg *valloxPackage) {

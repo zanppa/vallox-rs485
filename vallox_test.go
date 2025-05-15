@@ -23,6 +23,15 @@ func TestValueToTemp(t *testing.T) {
 	assertTemp(247, 100, t)
 }
 
+func TestTempToValue(t *testing.T) {
+	assertTempToValue(-74, 0, t)
+	assertTempToValue(100, 247, t)
+	assertTempToValue(97, 246, t)
+	assertTempToValue(22, 165, t)
+	assertTempToValue(0, 100, t)
+	assertTempToValue(40, 203, t)
+}
+
 func TestValueToSpeed(t *testing.T) {
 	assertSpeed(1, 1, t)
 	assertSpeed(3, 2, t)
@@ -46,12 +55,19 @@ func assertTemp(raw byte, value int16, t *testing.T) {
 	}
 }
 
+func assertTempToValue(temp int16, value byte, t *testing.T) {
+	if c, _ := tempToValue(temp, nil); c != value {
+		t.Errorf("temp %d was not converted to %d but to %d", temp, value, c)
+	}
+}
+
 func assertSpeed(raw byte, value int16, t *testing.T) {
+	v := new(Vallox)
 	if c, _ := valueToSpeed(raw, nil); c != value {
 		t.Errorf("raw %d to speed was not converted to %d but to %d", raw, value, c)
 	}
 
-	if c := speedToValue(int8(value)); c != raw {
+	if c, _ := speedToValue(int16(value), v); c != raw {
 		t.Errorf("speed %d to raw was not converted to %d but to %d", value, raw, c)
 	}
 }
