@@ -214,6 +214,25 @@ func (vallox *Vallox) SetSpeed(speed byte) {
 	vallox.writeRegister(RemoteClientMulticast, FanSpeed, value)
 }
 
+// SetRegister is a generic function to write to a register
+func (vallox *Vallox) SetRegister(register byte, value int16) {
+	writeFn, ok := writeAllowed[register]
+	if(!ok) {
+		vallox.logDebug.Printf("Trying to write to read-only register %x", register)
+		return
+	}
+	raw, ok := writeFn(value, vallox)
+	if(!ok) {
+		vallox.logDebug.Printf("Erroneous value to register %x: %x", register, value)
+		return
+	}
+	vallox.logDebug.Printf("received write reg %x = %x (%x)", register, value, raw)
+	// Send value to the main vallox device
+	vallox.writeRegister(DeviceMain, register, raw)
+	// Also publish value to all the remotes
+	vallox.writeRegister(RemoteClientMulticast, register, raw)
+}
+
 func sendInit(vallox *Vallox) {
 	vallox.Query(FanSpeed)
 }
